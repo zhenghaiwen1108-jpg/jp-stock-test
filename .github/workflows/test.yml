@@ -1,9 +1,18 @@
+
 name: Japan Stock Test
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ec-stock-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -19,8 +28,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requests
-        run: pip install requests
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
 
-      - name: Check stock websites
+      - name: Check stock
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python check.py
