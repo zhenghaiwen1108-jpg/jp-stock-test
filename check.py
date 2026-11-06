@@ -10,15 +10,19 @@ from bs4 import BeautifulSoup
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
-# EC-STORE V4.2
-# 商品库存监控与安全校准
+# EC-STORE V4.3
+# 库存检测 + 163邮件提醒
 
 PRODUCT_ID = "14192401"
 URL = f"https://www.ec-store.net/sws/g/g{PRODUCT_ID}/"
 
 API = "https://api.github.com"
-MARKER = "EC_STOCK_STATE_V3"
 ISSUE_TITLE = "EC-STORE inventory state (automatic)"
+MARKER = "EC_STOCK_STATE_V3"
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def github(method, path, **kwargs):
@@ -31,27 +35,22 @@ def github(method, path, **kwargs):
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-    response = requests.request(
+    r = requests.request(
         method,
         API + path.format(repo=repo),
         headers=headers,
         timeout=20,
         **kwargs
     )
-
-    response.raise_for_status()
-
-    return response.json() if response.content else {}
+    r.raise_for_status()
+    return r.json() if r.content else {}
 
 
 def get_state():
     issues = github(
         "GET",
         "/repos/{repo}/issues",
-        params={
-            "state": "open",
-            "per_page": 100
-        }
+        params={"state": "open", "per_page": 100}
     )
 
     for issue in issues:
@@ -59,19 +58,16 @@ def get_state():
             continue
 
         try:
-            state = json.loads(
-                issue.get("body") or "{}"
-            )
-
-            if state.get("marker") == MARKER:
-                return issue["number"], state
-
+            data = json.loads(issue.get("body") or "{}")
+            if data.get("marker") == MARKER:
+                return issue["number"], data
         except (ValueError, TypeError):
             pass
 
     return None, {
         "marker": MARKER,
-        "status": "unknown"
+        "status": "unknown",
+        "alerted": None
     }
 
 
@@ -83,7 +79,7 @@ def save_state(number, state):
     )
 
     if number is None:
-        github(
+        result = github(
             "POST",
             "/repos/{repo}/issues",
             json={
@@ -91,12 +87,14 @@ def save_state(number, state):
                 "body": body
             }
         )
-    else:
-        github(
-            "PATCH",
-            f"/repos/{{repo}}/issues/{number}",
-            json={"body": body}
-        )
+        return result["number"]
+
+    github(
+        "PATCH",
+        f"/repos/{{repo}}/issues/{number}",
+        json={"body": body}
+    )
+    return number
 
 
 def products(data):
@@ -105,12 +103,11 @@ def products(data):
             yield from products(item)
 
     elif isinstance(data, dict):
-        kind = data.get("@type", [])
+        kinds = data.get("@type", [])
+        if isinstance(kinds, str):
+            kinds = [kinds]
 
-        if isinstance(kind, str):
-            kind = [kind]
-
-        if "Product" in kind:
+        if "Product" in kinds:
             yield data
 
         for value in data.values():
@@ -131,154 +128,178 @@ def offer_status(offers):
         if not isinstance(offer, dict):
             continue
 
-        raw = str(
+        value = str(
             offer.get("availability") or ""
         ).rstrip("/").split("/")[-1]
 
-        if raw == "InStock":
+        if value == "InStock":
             states.append("instock")
-
-        elif raw in ("OutOfStock", "SoldOut"):
+        elif value in ("OutOfStock", "SoldOut"):
             states.append("soldout")
 
-    if not states:
-        return "unknown"
-
-    if len(set(states)) != 1:
+    if not states or len(set(states)) != 1:
         return "unknown"
 
     return states[0]
 
 
 def detect():
-    response = requests.get(
+    r = requests.get(
         URL,
         timeout=25,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
+        headers={"User-Agent": "Mozilla/5.0"}
     )
 
-    print("HTTP:", response.status_code)
-    response.raise_for_status()
+    print("HTTP:", r.status_code)
+    r.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
-
+    soup = BeautifulSoup(r.text, "html.parser")
     records = []
 
-    scripts = soup.find_all(
+    for script in soup.find_all(
         "script",
         type="application/ld+json"
-    )
-
-    for script in scripts:
+    ):
         try:
-            payload = json.loads(
+            data = json.loads(
                 script.string or script.get_text()
             )
-
         except (ValueError, TypeError):
             continue
 
-        for product in products(payload):
-            identifiers = [
+        for product in products(data):
+            ids = [
                 product.get("sku"),
                 product.get("productID"),
                 product.get("mpn")
             ]
 
-            identifiers = [
+            ids = [
                 str(x).strip()
-                for x in identifiers
+                for x in ids
                 if x is not None
             ]
 
-            if PRODUCT_ID not in identifiers:
-                continue
-
-            status = offer_status(
-                product.get("offers")
-            )
-
-            records.append(status)
+            if PRODUCT_ID in ids:
+                records.append(
+                    offer_status(product.get("offers"))
+                )
 
     known = {
         x for x in records
         if x != "unknown"
     }
 
-    if len(known) == 1:
-        structured = next(iter(known))
-    else:
-        structured = "unknown"
+    structured = (
+        next(iter(known))
+        if len(known) == 1
+        else "unknown"
+    )
 
     text = soup.get_text(" ", strip=True)
 
     free_soldout = bool(
-        re.search(
-            r"FREE\s*在庫なし",
-            text,
-            re.I
-        )
+        re.search(r"FREE\s*在庫なし", text, re.I)
     )
-
     restock = "再入荷お知らせ" in text
 
-    print("EC-STORE V4.2")
+    # 只检查可见且未禁用的购物按钮
+    # 不能把页面上任意文字当成购买按钮
+    buy_button = False
+
+    for element in soup.find_all(
+        ["button", "input", "a"]
+    ):
+        label = " ".join([
+            element.get_text(" ", strip=True),
+            str(element.get("value") or ""),
+            str(element.get("aria-label") or "")
+        ])
+
+        if not re.search(
+            r"カートに入れる|カートへ入れる",
+            label
+        ):
+            continue
+
+        classes = element.get("class") or []
+
+        disabled = (
+            element.has_attr("disabled")
+            or str(
+                element.get("aria-disabled", "")
+            ).lower() == "true"
+            or "disabled" in classes
+        )
+
+        if not disabled and not element.has_attr("hidden"):
+            buy_button = True
+
     print("匹配商品记录:", records)
     print("明确结构化状态:", structured)
     print("FREE 在庫なし:", free_soldout)
     print("再入荷お知らせ:", restock)
+    print("HTML购买按钮:", buy_button)
 
-    # 结构化数据和页面文字共同支持无货
+    # 双重证据支持无货
     if structured == "soldout" and (
         free_soldout or restock
     ):
         return "soldout"
 
+    # 明确有货数据与无货提示冲突
+    if structured == "instock" and free_soldout:
+        return "unknown"
+
     # 结构化数据提示有货
-    # 但尚未验证实际购买按钮
-    if (
-        structured == "instock"
-        and not free_soldout
-        and not restock
-    ):
+    if structured == "instock":
+        if buy_button:
+            return "candidate_button"
         return "candidate"
 
     return "unknown"
 
 
-def send_email():
-    required = (
+def send_email(status):
+    required = [
         "SMTP_HOST",
         "SMTP_PORT",
         "SMTP_USER",
         "SMTP_PASS",
         "MAIL_TO"
-    )
+    ]
 
     for key in required:
         if not os.getenv(key):
-            raise RuntimeError(
-                f"缺少配置: {key}"
-            )
+            raise RuntimeError(f"缺少配置: {key}")
 
     msg = EmailMessage()
 
-    msg["Subject"] = (
-        "【待确认补货】EC-STORE 14192401"
-    )
+    if status == "candidate_button":
+        subject = "【疑似补货】EC-STORE 已发现购买按钮"
+        description = (
+            "商品结构化数据提示有货，"
+            "HTML中也发现未标记禁用的购买按钮。"
+            "但尚未验证按钮实际可用。"
+        )
+    else:
+        subject = "【疑似补货】EC-STORE 库存数据变化"
+        description = (
+            "商品结构化数据提示有货，"
+            "但尚未确认实际购买按钮是否可用。"
+        )
 
+    msg["Subject"] = subject
     msg["From"] = os.environ["SMTP_USER"]
     msg["To"] = os.environ["MAIL_TO"]
 
     msg.set_content(
-        "商品库存数据提示可能补货，"
-        "请手动检查购买按钮。\n"
-        + URL
+        f"{description}\n\n"
+        f"商品编号：{PRODUCT_ID}\n"
+        f"检测时间（UTC）：{now()}\n"
+        f"商品链接：{URL}\n\n"
+        "请打开商品页面人工确认库存。\n"
+        "本提醒不保证商品一定可以买到。"
     )
 
     context = ssl.create_default_context()
@@ -289,54 +310,60 @@ def send_email():
         context=context,
         timeout=25
     ) as server:
-
         server.login(
             os.environ["SMTP_USER"],
             os.environ["SMTP_PASS"]
         )
-
         server.send_message(msg)
+
+    print("邮件已提交给SMTP服务器")
 
 
 def main():
-    print("EC-STORE V4.2 CHECK")
+    print("EC-STORE V4.3 AUTO ALERT")
 
     number, state = get_state()
-
-    previous = state.get(
-        "status",
-        "unknown"
-    )
-
+    previous = state.get("status", "unknown")
     current = detect()
 
     print("上次状态:", previous)
     print("当前状态:", current)
 
     if current == "unknown":
-        print("状态不确定，不更新历史，不发送邮件")
+        print("状态不确定，不通知")
         return
 
-    if current == "candidate":
-        print("可能补货，但尚未验证购买按钮")
-        print("本次不发送邮件")
+    if current == "soldout":
+        state["status"] = "soldout"
+        state["alerted"] = None
+        state["checked_at"] = now()
+        number = save_state(number, state)
+        print("无货基线已保存")
         return
 
-    # 只保存有双重证据支持的无货基线
-    state["status"] = "soldout"
+    # 仅从已记录的无货状态转变时通知
+    if previous != "soldout":
+        print("缺少无货基线，不发送提醒")
+        return
 
-    state["checked_at"] = datetime.now(
-        timezone.utc
-    ).isoformat()
+    # 防止同一次变化重复通知
+    if state.get("alerted") is not None:
+        print("已有提醒记录，不重复发送")
+        return
 
-    state["verification"] = (
-        "structured_plus_page_soldout"
-    )
+    # 先记录通知意图，降低重复发送风险
+    state["alerted"] = "pending"
+    state["alert_intent_at"] = now()
+    number = save_state(number, state)
 
+    send_email(current)
+
+    state["status"] = current
+    state["alerted"] = current
+    state["notified_at"] = now()
     save_state(number, state)
 
-    print("已记录无货基线")
-    print("有货验证与邮件自动提醒尚未启用")
+    print("疑似补货提醒已发送")
 
 
 if __name__ == "__main__":
