@@ -1,12 +1,8 @@
 
-import os
 import json
-import ssl
-import smtplib
+import os
 import requests
-
 from bs4 import BeautifulSoup
-from email.message import EmailMessage
 from datetime import datetime, timezone
 
 URL = "https://www.ec-store.net/sws/g/g14192401/"
@@ -22,35 +18,19 @@ HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28"
 }
 
-MARKER = "EC_STOCK_STATE_V3"
 ISSUE_TITLE = "EC-STORE inventory state (automatic)"
-
-IN_STOCK = {
-    "https://schema.org/InStock",
-    "http://schema.org/InStock",
-    "InStock"
-}
-
-OUT_OF_STOCK = {
-    "https://schema.org/OutOfStock",
-    "http://schema.org/OutOfStock",
-    "OutOfStock",
-    "https://schema.org/SoldOut",
-    "http://schema.org/SoldOut",
-    "SoldOut"
-}
+MARKER = "EC_STOCK_STATE_V3"
 
 
 def github(method, path, **kwargs):
-    response = requests.request(
-        method,
-        API + path,
+    r = requests.request(
+        method, API + path,
         headers=HEADERS,
         timeout=20,
         **kwargs
     )
-    response.raise_for_status()
-    return response.json() if response.content else {}
+    r.raise_for_status()
+    return r.json() if r.content else {}
 
 
 def get_state():
@@ -61,15 +41,13 @@ def get_state():
     )
 
     for issue in issues:
-        if issue.get("title") != ISSUE_TITLE:
-            continue
-
-        try:
-            data = json.loads(issue.get("body") or "{}")
-            if data.get("marker") == MARKER:
-                return issue["number"], data
-        except (ValueError, TypeError):
-            pass
+        if issue.get("title") == ISSUE_TITLE:
+            try:
+                data = json.loads(issue.get("body") or "{}")
+                if data.get("marker") == MARKER:
+                    return issue["number"], data
+            except (ValueError, TypeError):
+                pass
 
     return None, {
         "marker": MARKER,
@@ -84,20 +62,17 @@ def save_state(number, state):
         indent=2
     )
 
-    if number is not None:
+    if number is None:
+        github(
+            "POST",
+            f"/repos/{REPO}/issues",
+            json={"title": ISSUE_TITLE, "body": body}
+        )
+    else:
         github(
             "PATCH",
             f"/repos/{REPO}/issues/{number}",
             json={"body": body}
-        )
-    else:
-        github(
-            "POST",
-            f"/repos/{REPO}/issues",
-            json={
-                "title": ISSUE_TITLE,
-                "body": body
-            }
         )
 
 
@@ -107,237 +82,133 @@ def find_products(data):
             yield from find_products(item)
 
     elif isinstance(data, dict):
-        if data.get("@type") == "Product":
+        types = data.get("@type", [])
+        if isinstance(types, str):
+            types = [types]
+
+        if "Product" in types:
             yield data
 
-        elif isinstance(data.get("@type"), list):
-            if "Product" in data["@type"]:
-                yield data
-
         for value in data.values():
-            if isinstance(value, (dict, list)):
+            if isinstance(value, (list, dict)):
                 yield from find_products(value)
 
 
-def product_matches(product):
-    identifiers = [
-        product.get("sku"),
-        product.get("productID"),
-        product.get("mpn")
-    ]
-
-    for identifier in identifiers:
-        if str(identifier or "").strip() == PRODUCT_ID:
-            return True
-
-    return False
-
-
-def offer_status(offers):
+def get_availability(offers):
     if isinstance(offers, dict):
         offers = [offers]
 
     if not isinstance(offers, list) or not offers:
         return "unknown"
 
-    statuses = []
+    results = []
 
     for offer in offers:
         if not isinstance(offer, dict):
             return "unknown"
 
-        availability = str(
-            offer.get("availability") or ""
-        ).strip()
+        value = str(
+            offer.get("availability", "")
+        ).rstrip("/").split("/")[-1]
 
-        if availability in IN_STOCK:
-            statuses.append("instock")
-
-        elif availability in OUT_OF_STOCK:
-            statuses.append("soldout")
-
+        if value == "InStock":
+            results.append("instock")
+        elif value in ("OutOfStock", "SoldOut"):
+            results.append("soldout")
         else:
-            statuses.append("unknown")
+            results.append("unknown")
 
-    if "unknown" in statuses:
+    if "unknown" in results:
         return "unknown"
 
-    if "instock" in statuses:
-        return "instock"
-
-    if statuses and all(
-        s == "soldout" for s in statuses
-    ):
+    if all(x == "soldout" for x in results):
         return "soldout"
+
+    if all(x == "instock" for x in results):
+        return "instock"
 
     return "unknown"
 
 
 def detect():
-    response = requests.get(
+    r = requests.get(
         URL,
-        timeout=25,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(compatible; StockMonitor/4.0)"
-            )
-        }
+            "User-Agent": "Mozilla/5.0"
+        },
+        timeout=25
     )
 
-    print("HTTP:", response.status_code)
-    response.raise_for_status()
+    print("HTTP:", r.status_code)
+    r.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
+    soup = BeautifulSoup(r.text, "html.parser")
+    matches = []
 
-    scripts = soup.find_all(
+    for script in soup.find_all(
         "script",
         type="application/ld+json"
-    )
-
-    found = []
-
-    for script in scripts:
+    ):
         try:
             data = json.loads(script.string or script.text)
         except (ValueError, TypeError):
             continue
 
         for product in find_products(data):
-            if not product_matches(product):
+            ids = [
+                product.get("sku"),
+                product.get("productID"),
+                product.get("mpn")
+            ]
+
+            if PRODUCT_ID not in [
+                str(x).strip() for x in ids if x is not None
+            ]:
                 continue
 
-            found.append(
-                offer_status(product.get("offers"))
+            matches.append(
+                get_availability(product.get("offers"))
             )
 
-    print("匹配商品数量:", len(found))
-    print("商品状态记录:", found)
+    print("匹配商品数量:", len(matches))
+    print("商品状态记录:", matches)
 
-    if not found:
-        print("未找到匹配商品的结构化库存数据")
+    if not matches or "unknown" in matches:
         return "unknown"
 
-    if "unknown" in found:
-        return "unknown"
-
-    if all(s == "soldout" for s in found):
+    if all(x == "soldout" for x in matches):
         return "soldout"
 
-    if all(s == "instock" for s in found):
+    if all(x == "instock" for x in matches):
         return "instock"
 
     return "unknown"
 
 
-def send_email():
-    required = [
-        "SMTP_HOST",
-        "SMTP_PORT",
-        "SMTP_USER",
-        "SMTP_PASS",
-        "MAIL_TO"
-    ]
-
-    for key in required:
-        if not os.getenv(key):
-            raise RuntimeError(
-                f"缺少邮箱配置: {key}"
-            )
-
-    msg = EmailMessage()
-
-    msg["Subject"] = (
-        "【库存提醒】EC-STORE 商品库存状态变化"
-    )
-    msg["From"] = os.environ["SMTP_USER"]
-    msg["To"] = os.environ["MAIL_TO"]
-
-    msg.set_content(
-        "EC-STORE 商品检测到可能补货。\n\n"
-        f"商品编号：{PRODUCT_ID}\n"
-        f"商品链接：{URL}\n\n"
-        "请立即打开商品页面，"
-        "人工确认规格及实际库存。\n"
-        "本邮件不保证商品一定可以购买。"
-    )
-
-    context = ssl.create_default_context()
-
-    with smtplib.SMTP_SSL(
-        os.environ["SMTP_HOST"],
-        int(os.environ["SMTP_PORT"]),
-        context=context,
-        timeout=25
-    ) as server:
-
-        server.login(
-            os.environ["SMTP_USER"],
-            os.environ["SMTP_PASS"]
-        )
-
-        server.send_message(msg)
-
-    print("补货提醒已提交给邮件服务器")
-
-
 def main():
-    number, state = get_state()
+    print("EC-STORE V4.0 SAFE DIAGNOSTIC")
 
+    number, state = get_state()
     previous = state.get("status", "unknown")
     current = detect()
 
     print("上次状态:", previous)
     print("当前状态:", current)
 
-    now = datetime.now(
+    if current == "unknown":
+        print("无法确认商品库存，不发送邮件")
+        return
+
+    # V4诊断阶段只记录，不自动通知
+    state["status"] = current
+    state["checked_at"] = datetime.now(
         timezone.utc
     ).isoformat()
 
-    if current == "unknown":
-        print("库存无法确认，本次不发送邮件")
-        return
-
-    # 必须先有可靠的无货基线
-    # 才能判定无货转为有货
-    if previous == "soldout" and current == "instock":
-
-        print("检测到无货转为有货")
-
-        # 先记录通知意图，避免重复发送
-        state["status"] = "instock"
-        state["notification"] = "pending"
-        state["checked_at"] = now
-        save_state(number, state)
-
-        send_email()
-
-        state["notification"] = "sent"
-        state["notified_at"] = now
-        save_state(number, state)
-
-        print("补货提醒流程完成")
-        return
-
-    if current == "instock" and state.get(
-        "notification"
-    ) == "pending":
-        print("存在待核查通知，不自动重复发送")
-        return
-
-    if previous == current:
-        print("库存状态未变化，不重复通知")
-        return
-
-    state["status"] = current
-    state["checked_at"] = now
-
     save_state(number, state)
 
-    print("库存状态已保存")
+    print("历史状态已保存")
+    print("诊断模式：邮件提醒暂未启用")
 
 
 if __name__ == "__main__":
