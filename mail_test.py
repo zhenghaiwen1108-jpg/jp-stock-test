@@ -1,27 +1,51 @@
-name: Test 163 Email
 
-on:
-  workflow_dispatch:
+import os
+import ssl
+import smtplib
+from email.message import EmailMessage
 
-permissions:
-  contents: read
+# 读取 GitHub Secrets
+required = [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS",
+    "MAIL_TO"
+]
 
-jobs:
-  mail:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v4
+for key in required:
+    if not os.getenv(key):
+        raise RuntimeError(f"缺少邮箱配置: {key}")
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# 创建测试邮件
+msg = EmailMessage()
 
-      - name: Send test email
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python mail_test.py
+msg["Subject"] = "EC-STORE 库存监控邮件测试"
+msg["From"] = os.environ["SMTP_USER"]
+msg["To"] = os.environ["MAIL_TO"]
+
+msg.set_content(
+    "恭喜！\n\n"
+    "GitHub 云端邮件发送测试成功。\n\n"
+    "监控商品：EC-STORE 14192401\n"
+    "商品链接：\n"
+    "https://www.ec-store.net/sws/g/g14192401/\n\n"
+    "注意：这只是测试邮件，不代表商品补货。"
+)
+
+# 通过 SSL 连接163邮箱
+context = ssl.create_default_context()
+
+with smtplib.SMTP_SSL(
+    os.environ["SMTP_HOST"],
+    int(os.environ["SMTP_PORT"]),
+    context=context,
+    timeout=25
+) as server:
+    server.login(
+        os.environ["SMTP_USER"],
+        os.environ["SMTP_PASS"]
+    )
+    server.send_message(msg)
+
+print("测试邮件已提交给 SMTP 服务器")
